@@ -6,54 +6,59 @@ $db = new PDO('mysql:host=localhost; dbname=module; charset=utf8',
 null, 
 [PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC]);
 
-// 1. Проверка наличия токена : локально ($_SESSION['token']) и сравнение с бд
-//                  Если есть -> перекидываем на странцу пользователя / админа
-//                  Если нет -> остаёмся на этой странице
-
-$_SESSION['token'] = '';
-
-// Проверка : существует ли токен и что он не пустой
+// Проверка наличия токена
 if (isset($_SESSION['token']) && !empty($_SESSION['token'])) {
     $token = $_SESSION['token'];
-    //
-    $user = $db->query("SELECT id, type FROM users WHERE token = '$token'")->fetchALL();
+    $user = $db->query("SELECT id, type FROM users WHERE token = '$token'")->fetch();
     
-    if (empty($user)) {
-        $userType = $token[0]['type'];
+    if (!empty($user)) {
+        $userType = $user['type'];
         $isAdmin = $userType == 'admin';
         $isUser = $userType == 'user';
+        
+        if ($isAdmin) {
+            header('Location: admin.php');
+            exit;
+        } elseif ($isUser) {
+            header('Location: user.php');
+            exit;
+        }
     }
-    
-    $isAdmin && header('Location: admin.php');
-    $isUser && header('Location: user.php');
 }
-//  Проверака логина и пароля с БД , запись токена в БД, редирект
+
+// Проверка логина и пароля с БД
 if ($_SERVER['REQUEST_METHOD'] == 'POST') {
-    // 1. Получить отправленные данные (логин и пароль)
     $login = $_POST['login'] ?? '';
     $password = $_POST['password'] ?? '';
     
-    // 2. Проверить переданы ли они, если нет вернуть ошибку
-    // Если да -> ничего не делаем
-    // Если нет -> ошибка : поля необходтмо заполнить
     if (empty($login) || empty($password)) {
         $error = 'Поля необходимо заполнить';
     } else {
-        // 3. Сравнить с данными в БД
-        // Если совпали -> генерируем токен, записываем в сессию и бд, редирект
-        // Если нет -> Ошибка : неверный логин или пароль
-        $user = $db->query("SELECT id, password, type FROM users WHERE login = '$login'")->fetch();
+        $user = $db->query("SELECT id, password, type, blocked, amountAttempt, latest FROM users WHERE login = '$login'")->fetch();
         
-        if ($user && $user['password'] === $password) {
+        // Проверяем, не заблокирован ли пользователь
+        if ($user && $user['blocked'] == 1) {
+            $error = 'Пользователь заблокирован, обратитесь к администрации';
+        }
+        // Проверяем, не истекла ли дата последней активности (больше месяца)
+        elseif ($user && $user['latest'] && strtotime($user['latest']) < strtotime('-1 month')) {
+            $db->query("UPDATE users SET blocked = 1 WHERE id = {$user['id']}");
+            $error = 'Пользователь заблокирован из-за долгого отсутствия активности';
+        }
+        // Проверяем правильность пароля
+        elseif ($user && $user['password'] === $password) {
+            // Сбрасываем счетчик попыток
+            $db->query("UPDATE users SET amountAttempt = 0 WHERE id = {$user['id']}");
+            
             // Генерируем токен
             $token = bin2hex(random_bytes(16));
             
             // Записываем токен в сессию
             $_SESSION['token'] = $token;
             
-            // Записываем токен в БД
+            // Записываем токен и обновляем дату активности в БД
             $userId = $user['id'];
-            $db->query("UPDATE users SET token = '$token' WHERE id = $userId");
+            $db->query("UPDATE users SET token = '$token', latest = NOW() WHERE id = $userId");
             
             // Редирект в зависимости от типа пользователя
             if ($user['type'] === 'admin') {
@@ -64,7 +69,22 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                 exit;
             }
         } else {
-            $error = 'Неверный логин или пароль';
+            // Увеличиваем счетчик неудачных попыток
+            if ($user) {
+                $newAttempts = $user['amountAttempt'] + 1;
+                $db->query("UPDATE users SET amountAttempt = $newAttempts WHERE id = {$user['id']}");
+                
+                // Если попыток >= 3 - блокируем пользователя
+                if ($newAttempts >= 3) {
+                    $db->query("UPDATE users SET blocked = 1 WHERE id = {$user['id']}");
+                    $error = 'Превышено количество попыток входа. Пользователь заблокирован.';
+                } else {
+                    $remaining = 3 - $newAttempts;
+                    $error = "Неверный логин или пароль. Осталось попыток: $remaining";
+                }
+            } else {
+                $error = 'Неверный логин или пароль';
+            }
         }
     }
 }
@@ -92,7 +112,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
         </label>
         <input type="password" name="password" id="password" required>
          <button type = "submit">Вход</button>
-         <?php if(isset($error)): ?><p class="error"><?php echo $error; ?></p><?php endif; ?>
+         <?php if(isset($error)): ?><p class="error"><?php echo htmlspecialchars($error); ?></p><?php endif; ?>
         </form>
     </div>
 </body>
